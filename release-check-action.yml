@@ -1,0 +1,181 @@
+name: 'FtrIO Release Check'
+description: 'Validate that a target appsettings.json contains every toggle key required by this release. Pair with export-manifest-action to gate deployments on missing config.'
+author: 'FtrOnOff'
+
+branding:
+  icon: 'shield'
+  color: 'pink'
+
+inputs:
+  manifest:
+    description: 'Path to the toggle manifest JSON produced by export-manifest-action. Used when the manifest is already on disk.'
+    required: false
+    default: 'toggles.manifest.json'
+
+  artifact-name:
+    description: 'Name of the build artifact containing the manifest. If set, downloads it automatically before running the check.'
+    required: false
+    default: ''
+
+  config:
+    description: 'Path to the target appsettings.json to validate against. Mutually exclusive with config-url.'
+    required: false
+    default: ''
+
+  config-url:
+    description: 'URL to fetch the target appsettings.json from. Mutually exclusive with config.'
+    required: false
+    default: ''
+
+  config-auth-header:
+    description: 'Authorization header value for fetching config-url (e.g. "Bearer my-token"). Optional.'
+    required: false
+    default: ''
+
+  env-name:
+    description: 'Display name for the target environment shown in the report and annotations.'
+    required: false
+    default: 'Production'
+
+  fail-on-missing:
+    description: 'Fail the workflow if any toggle keys are missing from the target config.'
+    required: false
+    default: 'true'
+
+  warn-only:
+    description: 'Emit warning annotations but always exit 0. Overrides fail-on-missing.'
+    required: false
+    default: 'false'
+
+  markdown:
+    description: 'Path to write a markdown report. Uploaded as a build artifact if set.'
+    required: false
+    default: 'release-check-report.md'
+
+  version:
+    description: 'Version of FtrIO.onetwo to install. Defaults to latest stable.'
+    required: false
+    default: ''
+
+outputs:
+  missing-count:
+    description: 'Number of toggle keys missing from the target config'
+    value: ${{ steps.check.outputs.missing-count }}
+
+  present-count:
+    description: 'Number of toggle keys present in the target config'
+    value: ${{ steps.check.outputs.present-count }}
+
+  passed:
+    description: 'true if all toggle keys are present in the target config, false otherwise'
+    value: ${{ steps.check.outputs.passed }}
+
+  report-path:
+    description: 'Path to the markdown report (if markdown input was set)'
+    value: ${{ steps.check.outputs.report-path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: '8.0.x'
+
+    - name: Install FtrIO.onetwo
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.version }}" ]; then
+          dotnet tool install --global FtrIO.onetwo --version ${{ inputs.version }}
+        else
+          dotnet tool install --global FtrIO.onetwo
+        fi
+
+    - name: Download manifest artifact
+      if: inputs.artifact-name != ''
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+
+    - name: Fetch config from URL
+      if: inputs.config-url != ''
+      shell: bash
+      run: |
+        CURL_ARGS="-s -o target-appsettings.json"
+
+        if [ -n "${{ inputs.config-auth-header }}" ]; then
+          CURL_ARGS="$CURL_ARGS -H 'Authorization: ${{ inputs.config-auth-header }}'"
+        fi
+
+        curl $CURL_ARGS "${{ inputs.config-url }}"
+
+        if [ ! -f target-appsettings.json ]; then
+          echo "::error::FtrIO release-check: Failed to fetch config from ${{ inputs.config-url }}"
+          exit 3
+        fi
+
+        echo "Config fetched from ${{ inputs.config-url }}"
+
+    - name: Run release check
+      id: check
+      shell: bash
+      run: |
+        ARGS="--manifest ${{ inputs.manifest }} --env-name ${{ inputs.env-name }}"
+
+        if [ -n "${{ inputs.config }}" ]; then
+          ARGS="$ARGS --config ${{ inputs.config }}"
+        elif [ -f target-appsettings.json ]; then
+          ARGS="$ARGS --config target-appsettings.json"
+        fi
+
+        if [ -n "${{ inputs.markdown }}" ]; then
+          ARGS="$ARGS --markdown ${{ inputs.markdown }}"
+          echo "report-path=${{ inputs.markdown }}" >> $GITHUB_OUTPUT
+        fi
+
+        if [ "${{ inputs.warn-only }}" = "true" ]; then
+          ARGS="$ARGS --warn-only"
+        fi
+
+        set +e
+        OUTPUT=$(ftrio.onetwo release-check $ARGS 2>&1)
+        EXIT_CODE=$?
+        set -e
+
+        echo "$OUTPUT"
+
+        MISSING_COUNT=$(echo "$OUTPUT" | grep -c "❌" 2>/dev/null || echo "0")
+        PRESENT_COUNT=$(echo "$OUTPUT" | grep -c "✅" 2>/dev/null || echo "0")
+
+        if [ -z "$MISSING_COUNT" ]; then MISSING_COUNT=0; fi
+        if [ -z "$PRESENT_COUNT" ]; then PRESENT_COUNT=0; fi
+
+        echo "missing-count=$MISSING_COUNT" >> $GITHUB_OUTPUT
+        echo "present-count=$PRESENT_COUNT" >> $GITHUB_OUTPUT
+
+        if [ "$MISSING_COUNT" -gt "0" ]; then
+          echo "passed=false" >> $GITHUB_OUTPUT
+          while IFS= read -r line; do
+            if echo "$line" | grep -q "❌"; then
+              echo "::warning::FtrIO [${{ inputs.env-name }}]: $line"
+            fi
+          done <<< "$OUTPUT"
+        else
+          echo "passed=true" >> $GITHUB_OUTPUT
+        fi
+
+        if [ "${{ inputs.warn-only }}" = "true" ]; then
+          exit 0
+        fi
+
+        if [ "${{ inputs.fail-on-missing }}" = "true" ] && [ "$MISSING_COUNT" -gt "0" ]; then
+          echo "::error::FtrIO release-check: $MISSING_COUNT toggle key(s) missing from ${{ inputs.env-name }} config. Add the missing keys before deploying."
+          exit 1
+        fi
+
+    - name: Upload release check report
+      if: inputs.markdown != '' && always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-check-report
+        path: ${{ inputs.markdown }}
