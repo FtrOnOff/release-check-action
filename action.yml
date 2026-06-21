@@ -1,5 +1,5 @@
 name: 'FtrIO Release Check'
-description: 'Validate that a target appsettings.json contains every toggle key required by this release. Pair with export-manifest-action to gate deployments on missing config.'
+description: 'Validate a target appsettings.json contains every toggle key required by this release. Block deploys on missing config.'
 author: 'FtrOnOff'
 
 branding:
